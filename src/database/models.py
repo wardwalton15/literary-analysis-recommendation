@@ -13,9 +13,14 @@ from sqlalchemy import (
     Index,
     UniqueConstraint,
 )
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import relationship
 
-# Use the older declarative_base() for Python 3.7 compatibility
+# SQLAlchemy 1.4+ compatibility: declarative_base moved in 2.0
+try:
+    from sqlalchemy.orm import declarative_base
+except ImportError:
+    from sqlalchemy.ext.declarative import declarative_base
+
 Base = declarative_base()
 
 

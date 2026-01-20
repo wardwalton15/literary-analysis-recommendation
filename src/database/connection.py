@@ -42,14 +42,10 @@ def get_session_factory() -> sessionmaker:
 
 def get_session() -> Generator[Session, None, None]:
     """
-    Get a database session.
+    Get a database session as a context manager.
 
     Usage:
-        with next(get_session()) as session:
-            # use session
-
-    Or as a context manager:
-        for session in get_session():
+        with get_session() as session:
             # use session
     """
     SessionLocal = get_session_factory()
@@ -58,6 +54,33 @@ def get_session() -> Generator[Session, None, None]:
         yield session
     finally:
         session.close()
+
+
+class SessionContext:
+    """Context manager for database sessions."""
+
+    def __init__(self):
+        self._session = None
+        self._session_factory = get_session_factory()
+
+    def __enter__(self) -> Session:
+        self._session = self._session_factory()
+        return self._session
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._session:
+            self._session.close()
+        return False
+
+
+def get_session_context() -> SessionContext:
+    """Get a database session context manager.
+
+    Usage:
+        with get_session_context() as session:
+            # use session
+    """
+    return SessionContext()
 
 
 def init_db() -> None:

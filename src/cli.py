@@ -3,11 +3,13 @@
 import argparse
 import sys
 import logging
+import json
 from pathlib import Path
 
 from config.settings import get_settings
-from src.database.connection import init_db, reset_db
+from src.database.connection import init_db, reset_db, get_session_context
 from src.database.loaders import DataLoader
+from src.database.models import Book, AnalysisResult
 from src.scrapers.gutenberg_scraper import GutenbergScraper, GutenbergBatchDownloader
 from src.scrapers.kafka_manifest import get_kafka_book_ids, KAFKA_WORKS
 from src.scrapers.corpus_manifest import get_corpus_book_ids
@@ -164,6 +166,148 @@ def cmd_test_scraper(args):
         sys.exit(1)
 
 
+def cmd_analyze(args):
+    """Run NLP analysis on books."""
+    from src.analysis import AnalysisService
+
+    service = AnalysisService(use_spacy=not args.no_spacy)
+
+    # Determine which analyses to run
+    analyses = None
+    if args.type:
+        analyses = [args.type]
+
+    if args.book_id:
+        # Analyze specific book
+        print(f"Analyzing book ID {args.book_id}...")
+        try:
+            result = service.analyze_and_save(args.book_id, analyses)
+            print(f"\nAnalysis complete for: {result.book_title}")
+            print(f"Processing time: {result.processing_time:.2f}s")
+
+            if args.output:
+                with open(args.output, 'w') as f:
+                    json.dump(result.to_dict(), f, indent=2)
+                print(f"Results saved to: {args.output}")
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    elif args.kafka:
+        # Analyze all Kafka works
+        print("Analyzing Kafka works...")
+        results = service.analyze_kafka_works(language=args.language, analyses=analyses)
+        print(f"\nAnalyzed {len(results)} Kafka works")
+
+        for result in results:
+            print(f"  - {result.book_title}: {result.processing_time:.2f}s")
+
+    elif args.corpus:
+        # Analyze corpus
+        limit = args.limit
+        print(f"Analyzing corpus (limit: {limit or 'all'})...")
+        results = service.analyze_corpus(limit=limit, language=args.language, analyses=analyses)
+        print(f"\nAnalyzed {len(results)} books")
+
+    else:
+        print("Please specify --book-id, --kafka, or --corpus")
+        sys.exit(1)
+
+
+def cmd_analyze_summary(args):
+    """Show analysis summary."""
+    from src.analysis import AnalysisService
+
+    service = AnalysisService(use_spacy=False)
+    summary = service.get_analysis_summary()
+
+    print("\nAnalysis Summary:")
+    print("-" * 40)
+    print(f"  Total books with text: {summary['total_books_with_text']}")
+    print(f"  Books analyzed: {summary['books_analyzed']}")
+    print(f"  Coverage: {summary['coverage_percent']}%")
+    print("\n  Analysis counts:")
+    for analysis_type, count in summary['analysis_counts'].items():
+        print(f"    {analysis_type}: {count}")
+
+
+def cmd_show_analysis(args):
+    """Show analysis results for a book."""
+    from src.analysis import AnalysisService
+
+    with get_session_context() as session:
+        book = session.query(Book).get(args.book_id)
+        if not book:
+            print(f"Book {args.book_id} not found")
+            sys.exit(1)
+
+        print(f"\nAnalysis results for: {book.title}")
+        print("-" * 50)
+
+        # Get analysis results
+        results = session.query(AnalysisResult).filter(
+            AnalysisResult.book_id == args.book_id
+        ).all()
+
+        if not results:
+            print("No analysis results found. Run 'analyze' first.")
+            sys.exit(1)
+
+        for result in results:
+            print(f"\n[{result.analysis_type}] (v{result.model_version})")
+
+            if args.verbose:
+                data = json.loads(result.results_json)
+                print(json.dumps(data, indent=2)[:2000])
+            else:
+                # Show summary
+                data = json.loads(result.results_json)
+                if result.analysis_type == 'complexity':
+                    rd = data.get('readability', {})
+                    print(f"  Flesch Reading Ease: {rd.get('flesch_reading_ease', 'N/A')}")
+                    print(f"  Flesch-Kincaid Grade: {rd.get('flesch_kincaid_grade', 'N/A')}")
+                elif result.analysis_type == 'sentiment':
+                    ov = data.get('overall', {})
+                    print(f"  Polarity: {ov.get('polarity', 'N/A')}")
+                    print(f"  VADER Compound: {ov.get('vader_compound', 'N/A')}")
+                elif result.analysis_type == 'topics':
+                    print(f"  Topics found: {data.get('num_topics', 'N/A')}")
+                    print(f"  Theme labels: {', '.join(data.get('theme_labels', []))}")
+                elif result.analysis_type == 'entities':
+                    sm = data.get('summary', {})
+                    print(f"  Characters: {sm.get('character_count', 'N/A')}")
+                    print(f"  Locations: {sm.get('location_count', 'N/A')}")
+
+
+def cmd_list_books(args):
+    """List books in the database."""
+    with get_session_context() as session:
+        query = session.query(Book)
+
+        if args.language:
+            query = query.filter(Book.language == args.language)
+
+        if args.with_text:
+            query = query.filter(Book.full_text.isnot(None))
+
+        if args.analyzed:
+            analyzed_ids = session.query(AnalysisResult.book_id).distinct()
+            query = query.filter(Book.id.in_(analyzed_ids))
+
+        books = query.limit(args.limit or 100).all()
+
+        print(f"\nBooks ({len(books)} shown):")
+        print("-" * 70)
+        for book in books:
+            text_status = "+" if book.full_text else "-"
+            analysis_count = session.query(AnalysisResult).filter(
+                AnalysisResult.book_id == book.id
+            ).count()
+            analyzed_status = f"[{analysis_count}]" if analysis_count else "[ ]"
+
+            print(f"  {book.id:4d} {text_status} {analyzed_status} {book.title[:50]}")
+
+
 def main():
     """Main entry point for the CLI."""
     parser = argparse.ArgumentParser(
@@ -234,6 +378,73 @@ def main():
         "--book-id", type=int, help="Gutenberg book ID to test with"
     )
     test_parser.set_defaults(func=cmd_test_scraper)
+
+    # analyze command (Phase 2)
+    analyze_parser = subparsers.add_parser(
+        "analyze", help="Run NLP analysis on books"
+    )
+    analyze_parser.add_argument(
+        "--book-id", type=int, help="Analyze specific book by ID"
+    )
+    analyze_parser.add_argument(
+        "--kafka", action="store_true", help="Analyze all Kafka works"
+    )
+    analyze_parser.add_argument(
+        "--corpus", action="store_true", help="Analyze entire corpus"
+    )
+    analyze_parser.add_argument(
+        "--limit", type=int, help="Limit number of books (for corpus)"
+    )
+    analyze_parser.add_argument(
+        "--language", default="en", help="Filter by language (default: en)"
+    )
+    analyze_parser.add_argument(
+        "--type", choices=["preprocessing", "complexity", "sentiment", "topics", "entities"],
+        help="Run specific analysis type only"
+    )
+    analyze_parser.add_argument(
+        "--no-spacy", action="store_true", help="Skip spaCy-based entity analysis"
+    )
+    analyze_parser.add_argument(
+        "--output", "-o", help="Save results to JSON file"
+    )
+    analyze_parser.set_defaults(func=cmd_analyze)
+
+    # analyze-summary command
+    summary_parser = subparsers.add_parser(
+        "analyze-summary", help="Show analysis summary"
+    )
+    summary_parser.set_defaults(func=cmd_analyze_summary)
+
+    # show-analysis command
+    show_parser = subparsers.add_parser(
+        "show-analysis", help="Show analysis results for a book"
+    )
+    show_parser.add_argument(
+        "book_id", type=int, help="Book ID to show analysis for"
+    )
+    show_parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Show detailed results"
+    )
+    show_parser.set_defaults(func=cmd_show_analysis)
+
+    # list-books command
+    list_parser = subparsers.add_parser(
+        "list-books", help="List books in database"
+    )
+    list_parser.add_argument(
+        "--language", help="Filter by language"
+    )
+    list_parser.add_argument(
+        "--with-text", action="store_true", help="Only show books with text"
+    )
+    list_parser.add_argument(
+        "--analyzed", action="store_true", help="Only show analyzed books"
+    )
+    list_parser.add_argument(
+        "--limit", type=int, help="Limit number of books shown"
+    )
+    list_parser.set_defaults(func=cmd_list_books)
 
     args = parser.parse_args()
 
