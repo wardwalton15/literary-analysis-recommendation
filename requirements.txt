@@ -38,6 +38,11 @@ chardet>=4.0.0
 # VADER Sentiment
 vaderSentiment>=3.3.0
 
+# Dashboard (Phase 3)
+streamlit>=1.28.0
+plotly>=5.18.0
+pyvis>=0.3.2
+
 # Testing
 pytest>=7.0.0
 pytest-cov>=3.0.0
